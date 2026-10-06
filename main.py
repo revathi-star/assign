@@ -45,29 +45,35 @@ def execute_python_code(code: str) -> dict:
 
 import httpx
 import json
+import os
+from typing import List
 
 def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
     aipipe_token = os.environ.get("AIPIPE_TOKEN")
     
-    # 1. Fallback safety if environment variable is missing
     if not aipipe_token:
         print("ERROR: AIPIPE_TOKEN environment variable is not set!")
-        return [1]
+        return []
 
+    # OPTIMIZED PROMPT: Forces the LLM to follow deterministic extraction rules
     prompt = f"""
-    Analyze this Python code and its error traceback.
-    Identify the line number(s) where the error occurred.
+    You are a precise Python debugging tool. Your task is to extract the exact line number where the runtime error or syntax error occurred by analyzing the provided TRACEBACK.
 
-    CODE:
+    CRITICAL INSTRUCTIONS:
+    1. Read the TRACEBACK from the bottom up.
+    2. Look for patterns like 'File "<string>", line X' or 'File "<stdin>", line X' inside the TRACEBACK string. The number X is the exact line number where the error occurred.
+    3. Do NOT guess line 1 unless the traceback explicitly points to line 1.
+    4. Base your response purely on the line numbers explicitly present in the traceback string.
+
+    CODE TO REFERENCE:
     {code}
 
-    TRACEBACK:
+    TRACEBACK TO ANALYZE:
     {error_traceback}
 
-    Return the line number(s) where the error is located.
+    Return the line number(s) in the required structured output schema.
     """
 
-    # 2. Structure request explicitly to conform to OpenRouter/Gemini standards
     url = "https://aipipe.org"
     headers = {
         "Authorization": f"Bearer {aipipe_token}",
@@ -77,7 +83,6 @@ def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
     payload = {
         "model": "google/gemini-2.0-flash-lite-001",
         "messages": [{"role": "user", "content": prompt}],
-        # Force JSON mode structured outputs using standard parameters
         "response_format": {
             "type": "json_object",
             "schema": {
@@ -93,13 +98,11 @@ def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
         }
     }
 
-    # 3. Synchronous post method dispatch via clean HTTP request pipeline
     try:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             
-            # Parse structure cleanly out from standard OpenRouter content nesting formats
             data = response.json()
             content_str = data["choices"][0]["message"]["content"]
             result = json.loads(content_str)
@@ -107,8 +110,8 @@ def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
             return result.get("error_lines", [])
     except Exception as e:
         print(f"AI Analysis Failed: {str(e)}")
-        # Graceful assignment auto-grader fallback line identification
-        return [1]
+        return []
+
 
 
 # 7. Create the POST Endpoint required by the task
