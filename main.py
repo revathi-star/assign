@@ -35,39 +35,42 @@ def execute_python_code(code: str) -> dict:
         output = sys.stdout.getvalue()
         return {"success": True, "output": output}
     except Exception:
-        # Capture standard runtime errors
         output = traceback.format_exc()
         return {"success": False, "output": output}
     except SyntaxError:
-        # Explicitly capture compilation/syntax errors which lack a full execution traceback
         output = traceback.format_exc()
         return {"success": False, "output": output}
     finally:
         sys.stdout = old_stdout
 
-def extract_line_numbers_from_traceback(tb_str: str) -> List[int]:
+def extract_line_numbers_from_traceback(tb_str: str, max_lines_in_user_code: int) -> List[int]:
     """
-    A robust parser that scans the traceback string for both typical execution
-    errors and unique Python SyntaxError line indicators.
+    Scans the traceback string and cleanly filters out any lines that fall outside 
+    the boundaries of the user's raw submitted snippet code block length.
     """
     lines = set()
     
     # Pattern 1: Standard runtime tracebacks (e.g., File "<string>", line 3)
     standard_matches = re.findall(r'File\s+"[^"]+",\s+line\s+(\d+)', tb_str)
     for m in standard_matches:
-        lines.add(int(m))
+        val = int(m)
+        # ONLY accept line numbers that exist within the user's submitted code length
+        if val <= max_lines_in_user_code:
+            lines.add(val)
         
-    # Pattern 2: SyntaxError explicit line summaries (e.g., File "<string>", line 2)
+    # Pattern 2: SyntaxError explicit line summaries (e.g., line 2)
     syntax_matches = re.findall(r'line\s+(\d+)\s*\n', tb_str)
     for m in syntax_matches:
-        lines.add(int(m))
+        val = int(m)
+        if val <= max_lines_in_user_code:
+            lines.add(val)
         
     return sorted(list(lines))
 
 def analyze_error_with_ai(code: str, error_traceback: str, extracted_lines: List[int]) -> List[int]:
     """
     Uses the AI Pipe OpenRouter proxy to analyze the error context, using
-    the extracted line numbers as a precise steering hint.
+    the cleanly filtered line numbers as a precise steering hint.
     """
     aipipe_token = os.environ.get("AIPIPE_TOKEN")
     if not aipipe_token:
@@ -79,6 +82,7 @@ def analyze_error_with_ai(code: str, error_traceback: str, extracted_lines: List
     CRITICAL ANALYSIS CONTEXT:
     - Traceback string analysis points to line number(s): {extracted_lines}
     - Carefully cross-reference the original code structure below to confirm the precise line number(s) that directly caused or contains the syntax/runtime issue.
+    - NEVER return line numbers that do not exist or are unrelated to the code lines below.
 
     ORIGINAL CODE:
     {code}
@@ -121,9 +125,13 @@ def analyze_error_with_ai(code: str, error_traceback: str, extracted_lines: List
             data = response.json()
             content_str = data["choices"]["message"]["content"]
             result = json.loads(content_str)
-            return result.get("error_lines", extracted_lines)
+            
+            ai_lines = result.get("error_lines", extracted_lines)
+            # Extra safety: Ensure the AI doesn't hallucinate numbers outside the user code boundaries
+            total_user_lines = len(code.splitlines())
+            return [line for line in ai_lines if line <= total_user_lines]
+            
     except Exception:
-        # Fallback to safely parsed line numbers if the network proxy experiences a blip
         return extracted_lines
 
 @app.post("/code-interpreter")
@@ -136,10 +144,13 @@ async def code_interpreter(request: CodeRequest):
             "result": execution["output"]
         }
     else:
-        # Deterministically parse out the numbers first
-        parsed_lines = extract_line_numbers_from_traceback(execution["output"])
+        # Calculate how many lines are actually in the user code block submission
+        user_code_line_count = len(request.code.splitlines())
         
-        # Invoke AI to validate, reconcile, and format the lines properly
+        # Parse out line numbers, automatically dropping internal backend stack references
+        parsed_lines = extract_line_numbers_from_traceback(execution["output"], user_code_line_count)
+        
+        # Invoke AI validation with strict boundaries enforced
         final_lines = analyze_error_with_ai(request.code, execution["output"], parsed_lines)
         
         return {
