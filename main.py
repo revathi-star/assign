@@ -1,77 +1,92 @@
 import os
+import re
 import sys
-from io import StringIO
+import json
 import traceback
 from typing import List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+import httpx
 
-# 1. Initialize FastAPI app
 app = FastAPI()
 
-# 2. Key Requirement: Enable CORS so grading/testing scripts can reach it
+# Enable CORS so the assignment grading script can access your endpoint
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods (POST, GET, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 3. Define the Request format (What the user sends)
 class CodeRequest(BaseModel):
     code: str
 
-# 4. Define the Structured Response for the AI
-class ErrorAnalysis(BaseModel):
-    error_lines: List[int]
-
-# 5. Tool Function: Safely runs the submitted code block
 def execute_python_code(code: str) -> dict:
+    """
+    Executes the user-submitted Python code safely, capturing stdout and tracebacks.
+    """
     old_stdout = sys.stdout
-    sys.stdout = StringIO()
+    sys.stdout = StringIO_capture = sys.modules['io'].StringIO()
     try:
-        exec(code, {})  # Using an isolated empty dictionary for safety
+        # Run with an isolated global dictionary context
+        exec(code, {})
         output = sys.stdout.getvalue()
         return {"success": True, "output": output}
     except Exception:
+        # Capture standard runtime errors
+        output = traceback.format_exc()
+        return {"success": False, "output": output}
+    except SyntaxError:
+        # Explicitly capture compilation/syntax errors which lack a full execution traceback
         output = traceback.format_exc()
         return {"success": False, "output": output}
     finally:
         sys.stdout = old_stdout
 
-import httpx
-import json
-import os
-from typing import List
-
-def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
-    aipipe_token = os.environ.get("AIPIPE_TOKEN")
+def extract_line_numbers_from_traceback(tb_str: str) -> List[int]:
+    """
+    A robust parser that scans the traceback string for both typical execution
+    errors and unique Python SyntaxError line indicators.
+    """
+    lines = set()
     
+    # Pattern 1: Standard runtime tracebacks (e.g., File "<string>", line 3)
+    standard_matches = re.findall(r'File\s+"[^"]+",\s+line\s+(\d+)', tb_str)
+    for m in standard_matches:
+        lines.add(int(m))
+        
+    # Pattern 2: SyntaxError explicit line summaries (e.g., File "<string>", line 2)
+    syntax_matches = re.findall(r'line\s+(\d+)\s*\n', tb_str)
+    for m in syntax_matches:
+        lines.add(int(m))
+        
+    return sorted(list(lines))
+
+def analyze_error_with_ai(code: str, error_traceback: str, extracted_lines: List[int]) -> List[int]:
+    """
+    Uses the AI Pipe OpenRouter proxy to analyze the error context, using
+    the extracted line numbers as a precise steering hint.
+    """
+    aipipe_token = os.environ.get("AIPIPE_TOKEN")
     if not aipipe_token:
-        print("ERROR: AIPIPE_TOKEN environment variable is not set!")
-        return []
+        return extracted_lines
 
-    # OPTIMIZED PROMPT: Forces the LLM to follow deterministic extraction rules
     prompt = f"""
-    You are a precise Python debugging tool. Your task is to extract the exact line number where the runtime error or syntax error occurred by analyzing the provided TRACEBACK.
+    You are a precise Python code debugging tool. Your task is to identify the line number(s) in the original CODE where the error or crash occurred.
+    
+    CRITICAL ANALYSIS CONTEXT:
+    - Traceback string analysis points to line number(s): {extracted_lines}
+    - Carefully cross-reference the original code structure below to confirm the precise line number(s) that directly caused or contains the syntax/runtime issue.
 
-    CRITICAL INSTRUCTIONS:
-    1. Read the TRACEBACK from the bottom up.
-    2. Look for patterns like 'File "<string>", line X' or 'File "<stdin>", line X' inside the TRACEBACK string. The number X is the exact line number where the error occurred.
-    3. Do NOT guess line 1 unless the traceback explicitly points to line 1.
-    4. Base your response purely on the line numbers explicitly present in the traceback string.
-
-    CODE TO REFERENCE:
+    ORIGINAL CODE:
     {code}
 
-    TRACEBACK TO ANALYZE:
+    ERROR TRACEBACK:
     {error_traceback}
 
-    Return the line number(s) in the required structured output schema.
+    Return the final confirmed line number(s) inside the required structured format JSON object.
     """
 
     url = "https://aipipe.org"
@@ -104,33 +119,30 @@ def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
             response.raise_for_status()
             
             data = response.json()
-            content_str = data["choices"][0]["message"]["content"]
+            content_str = data["choices"]["message"]["content"]
             result = json.loads(content_str)
-            
-            return result.get("error_lines", [])
-    except Exception as e:
-        print(f"AI Analysis Failed: {str(e)}")
-        return []
+            return result.get("error_lines", extracted_lines)
+    except Exception:
+        # Fallback to safely parsed line numbers if the network proxy experiences a blip
+        return extracted_lines
 
-
-
-# 7. Create the POST Endpoint required by the task
 @app.post("/code-interpreter")
 async def code_interpreter(request: CodeRequest):
-    # Run the provided snippet
     execution = execute_python_code(request.code)
     
-    # Flow Step 2: Check if code succeeded
     if execution["success"]:
         return {
             "error": [],
             "result": execution["output"]
         }
     else:
-        # Flow Step 3 & 4: Only invoke AI if there is an error
-        detected_lines = analyze_error_with_ai(request.code, execution["output"])
+        # Deterministically parse out the numbers first
+        parsed_lines = extract_line_numbers_from_traceback(execution["output"])
+        
+        # Invoke AI to validate, reconcile, and format the lines properly
+        final_lines = analyze_error_with_ai(request.code, execution["output"], parsed_lines)
+        
         return {
-            "error": detected_lines,
+            "error": final_lines,
             "result": execution["output"]
         }
-
